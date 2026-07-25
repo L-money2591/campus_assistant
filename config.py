@@ -14,7 +14,8 @@ DB_PATH = "./vector_db"
 CACHE_MAX = 50
 
 # ===================== LoRA微调配置 =====================
-TRAIN_DATA_PATH = "./data/train_data.json"
+# 修复：train_data.json 在仓库根目录，默认路径改为根路径或调整到 data/ 目录
+TRAIN_DATA_PATH = "./train_data.json"
 LORA_WEIGHT_PATH = "./lora_weights/"
 LORA_R = 8
 LORA_ALPHA = 16
