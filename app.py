@@ -14,50 +14,27 @@ from config import *
 # 微调本地模型依赖（仅USE_FINETUNE_MODEL=True时生效）
 finetune_model = None
 finetune_tokenizer = None
+if USE_FINETUNE_MODEL:
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
 app = FastAPI(title="校园智能助手")
 MAX_INPUT_LENGTH = 200
 
 # ========== LLM入口（支持在线API / 本地微调LoRA模型） ==========
 def get_llm(t=0.3):
-    """
-    返回一个兼容的 LLM 对象：
-    - 若 USE_FINETUNE_MODEL 为 True，返回 LocalLLM（包含 invoke() 与 __call__()，invoke 返回有 .content 属性的对象）
-    - 否则返回 ChatOpenAI 实例（langchain_openai）
-    """
     global finetune_model, finetune_tokenizer
     if USE_FINETUNE_MODEL:
-        # 延迟加载微调模型
         if finetune_model is None:
-            from peft import PeftModel
-            from transformers import AutoModelForCausalLM, AutoTokenizer
             base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
             finetune_model = PeftModel.from_pretrained(base_model, LORA_WEIGHT_PATH)
             finetune_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-        def local_infer_str(prompt: str, temperature: float = t, max_new_tokens: int = 512) -> str:
+        def local_infer(prompt):
             inputs = finetune_tokenizer(prompt, return_tensors="pt")
-            outputs = finetune_model.generate(**inputs, temperature=temperature, max_new_tokens=max_new_tokens)
+            outputs = finetune_model.generate(**inputs, temperature=t, max_new_tokens=512)
             return finetune_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # 包装成具有 invoke()/__call__() 且 invoke 返回对象包含 .content 的类，兼容 app 中对 llm.invoke(...).content 的使用
-        class LocalLLM:
-            def __init__(self, infer_func):
-                self._infer = infer_func
-
-            def invoke(self, prompt: str):
-                class R:
-                    def __init__(self, content):
-                        self.content = content
-                return R(self._infer(prompt))
-
-            def __call__(self, prompt: str):
-                # 返回字符串，便于直接调用 llm(prompt)
-                return self._infer(prompt)
-
-        return LocalLLM(local_infer_str)
+        return local_infer
     else:
-        # 远程/在线模型（langchain ChatOpenAI）
         return ChatOpenAI(
             api_key=API_KEY,
             base_url=BASE_URL,
@@ -65,45 +42,6 @@ def get_llm(t=0.3):
             temperature=t,
             request_timeout=30
         )
-
-def call_llm(llm, prompt: str) -> str:
-    """
-    统一调用 llm，并返回字符串结果。
-    兼容：llm.invoke(...).content, llm(...), llm.invoke(...)=str, llm(...) 返回 dict 等。
-    """
-    try:
-        if hasattr(llm, "invoke"):
-            out = llm.invoke(prompt)
-        else:
-            out = llm(prompt)
-    except TypeError:
-        # 有些 LLM 可能需要 named args or dict input; fallback:
-        try:
-            out = llm({"input": prompt})
-        except Exception as e:
-            raise
-
-    # 解析常见返回格式
-    if out is None:
-        return ""
-    if isinstance(out, str):
-        return out
-    if hasattr(out, "content"):
-        return out.content
-    if isinstance(out, dict):
-        # 常见结构检查
-        for key in ("output", "text", "answer", "content"):
-            if key in out:
-                val = out[key]
-                if isinstance(val, str):
-                    return val
-        # 若字典中含 choices
-        if "choices" in out and isinstance(out["choices"], list) and len(out["choices"]) > 0:
-            c = out["choices"][0]
-            if isinstance(c, dict) and "text" in c:
-                return c["text"]
-    # 回退到字符串化
-    return str(out)
 
 # ========== LRU缓存模块 ==========
 cache = OrderedDict()
@@ -120,13 +58,51 @@ def set_cache(question, answer):
             cache.popitem(last=False)
     cache[question] = answer
 
+# ========== 自动建库：向量库不存在时从txt源文件重建 ==========
+def ensure_vector_db():
+    """检测 vector_db 是否存在，不存在则从知识库源文件自动构建"""
+    import glob
+    # ChromaDB 会生成 chroma.sqlite3 等文件，检测是否有数据文件
+    db_exists = os.path.exists(DB_PATH) and len(glob.glob(os.path.join(DB_PATH, "*"))) > 0
+    if db_exists:
+        print(f"✅ 检测到已有向量库 {DB_PATH}，跳过构建")
+        return True
+    print(f"⚠️  向量库不存在，开始自动构建...")
+    try:
+        from langchain_community.document_loaders import TextLoader
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        # 查找所有 .txt 知识库文件
+        txt_files = glob.glob("./*.txt")
+        # 排除 requirements.txt
+        txt_files = [f for f in txt_files if f != "./requirements.txt"]
+        if not txt_files:
+            print("❌ 未找到知识库源文件(.txt)，请上传图书馆.txt 食堂快递.txt")
+            return False
+        docs = []
+        for f in txt_files:
+            loader = TextLoader(f, encoding="utf-8")
+            docs.extend(loader.load())
+        splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+        split_docs = splitter.split_documents(docs)
+        emb = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        Chroma.from_documents(split_docs, emb, persist_directory=DB_PATH)
+        print(f"✅ 向量库构建完成！共 {len(split_docs)} 个文本块")
+        return True
+    except Exception as e:
+        print(f"❌ 自动建库失败：{e}")
+        return False
+
 # ========== RAG向量检索 ==========
-try:
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-    vector_db = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
-    retriever = vector_db.as_retriever(search_kwargs={"k": 2})
-except Exception as e:
-    print(f"向量库初始化失败：{e}")
+if ensure_vector_db():
+    try:
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        vector_db = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+        retriever = vector_db.as_retriever(search_kwargs={"k": 2})
+    except Exception as e:
+        print(f"向量库初始化失败：{e}")
+        embeddings = None
+        retriever = None
+else:
     embeddings = None
     retriever = None
 def rag_search(query):
@@ -151,93 +127,37 @@ def cot_route_plan(query):
     参考信息：{rag_search(query)}
     """
     llm = get_llm(0.2)
-    return call_llm(llm, cot_prompt)
+    if USE_FINETUNE_MODEL:
+        return llm(cot_prompt)
+    return llm.invoke(cot_prompt).content
 
 # ========== Agent工具函数 ==========
 @tool
 def empty_classroom(building: str, time: str) -> str:
     """查询指定教学楼指定时间段的空教室"""
     return f"{building} {time} 空教室：102、205、308"
-
 @tool
 def campus_weather() -> str:
     """查询校园今日天气"""
     return "今日晴，26℃，微风，适合出门"
-
-# 将所有工具放入列表
-tools = [empty_classroom, campus_weather]
-
+tools = [empty_classroom]
 def get_agent():
-    """
-    根据 langchain 版本差异，create_openai_tools_agent 可能存在差异。
-    这里尽量传入一个 llm 对象（如果是本地微调，get_llm 已经返回兼容的包装对象）。
-    """
     prompt = ChatPromptTemplate.from_messages([
         ("system", "你是校园助手，优先用工具查信息，回答口语化"),
         ("user", "{input}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
-    llm_obj = get_llm(0.1)
-    try:
-        agent = create_openai_tools_agent(llm_obj, tools, prompt)
-        return AgentExecutor(agent=agent, tools=tools, verbose=False)
-    except Exception:
-        # 如果 create_openai_tools_agent/AgentExecutor 的签名不匹配，尝试返回 agent object 作为-is（有可能 create_openai_tools_agent 已返回 AgentExecutor）
-        try:
-            return create_openai_tools_agent(llm_obj, tools, prompt)
-        except Exception as e:
-            # 最后回退为 None（调用端会做处理）
-            print(f"无法创建 agent：{e}")
-            return None
+    agent = create_openai_tools_agent(get_llm(0.1), tools, prompt)
+    return AgentExecutor(agent=agent, tools=tools, verbose=False)
 
-def run_agent(agent, question: str) -> str:
-    """
-    防御性地运行 agent，兼容多种 agent API：
-    - agent.run(question)
-    - agent.invoke({'input': question})
-    - agent({'input': question})
-    - agent.execute / agent.__call__
-    最终返回字符串。
-    """
-    if agent is None:
-        return "Agent 不可用"
-    # 尝试多种调用方式
-    try:
-        if hasattr(agent, "run"):
-            out = agent.run(question)
-            if isinstance(out, str):
-                return out
-        if hasattr(agent, "invoke"):
-            out = agent.invoke({"input": question})
-            # out 可能是 dict 或对象
-            if isinstance(out, dict) and "output" in out:
-                return out["output"]
-            if hasattr(out, "content"):
-                return out.content
-            if isinstance(out, str):
-                return out
-        # 直接调用
-        try:
-            out = agent({"input": question})
-            if isinstance(out, dict):
-                for k in ("output", "text", "answer"):
-                    if k in out and isinstance(out[k], str):
-                        return out[k]
-            if isinstance(out, str):
-                return out
-        except Exception:
-            pass
-    except Exception as e:
-        return f"Agent 调用出错：{e}"
-    # 最后回退
-    return "Agent 未返回结果"
-
-# ========== 双Agent协作（检索+口语生成，模拟微调效果） ==========
+# ========== 双Agent协作（检索+口语生成,拟微调效果） ==========
 def retrieval_agent(query):
     info = rag_search(query)
     prompt = f"把下面的信息整理成3条以内的要点，不要多余话：\n{info}"
     llm = get_llm(0)
-    return call_llm(llm, prompt)
+    if USE_FINETUNE_MODEL:
+        return llm(prompt)
+    return llm.invoke(prompt).content
 
 def generate_agent(query, points):
     prompt = f"""
@@ -249,7 +169,9 @@ def generate_agent(query, points):
     3. 不编造信息，全部基于给你的要点；
     """
     llm = get_llm(0.7)
-    return call_llm(llm, prompt)
+    if USE_FINETUNE_MODEL:
+        return llm(prompt)
+    return llm.invoke(prompt).content
 
 def double_agent_answer(query):
     points = retrieval_agent(query)
@@ -271,7 +193,7 @@ def ask(question: str, mode: str = "normal"):
             ans = cot_route_plan(question)
         elif mode == "tool":
             agent = get_agent()
-            ans = run_agent(agent, question)
+            ans = agent.invoke({"input": question})["output"]
         elif mode == "double" or mode == "normal":
             ans = double_agent_answer(question)
         else:
@@ -281,15 +203,15 @@ def ask(question: str, mode: str = "normal"):
     set_cache(cache_key, ans)
     return {"answer": ans, "source": "模型生成"}
 
-# 前端页面路由（直接读取根目录 index.html）
+# 前端页面路由
 @app.get("/", response_class=HTMLResponse)
 async def chat_page():
     try:
-        with open("index.html", "r", encoding="utf-8") as f:
+        with open("templates/index.html", "r", encoding="utf-8") as f:
             html_content = f.read()
         return HTMLResponse(content=html_content)
     except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="前端页面 index.html 缺失（请确保仓库根目录存在 index.html 或修改路径）")
+        raise HTTPException(status_code=500, detail="templates文件夹下前端页面缺失")
 
 if __name__ == "__main__":
     import uvicorn
