@@ -58,16 +58,16 @@ def set_cache(question, answer):
             cache.popitem(last=False)
     cache[question] = answer
 
-# ========== 自动建库：向量库不存在时从txt源文件重建 ==========
+# ========== 自动建库 ==========
 def ensure_vector_db():
     """检测 vector_db 是否存在，不存在则从知识库源文件自动构建"""
     import glob
     # ChromaDB 会生成 chroma.sqlite3 等文件，检测是否有数据文件
     db_exists = os.path.exists(DB_PATH) and len(glob.glob(os.path.join(DB_PATH, "*"))) > 0
     if db_exists:
-        print(f"✅ 检测到已有向量库 {DB_PATH}，跳过构建")
+        print(f" 检测到已有向量库 {DB_PATH}，跳过构建")
         return True
-    print(f"⚠️  向量库不存在，开始自动构建...")
+    print(f"  向量库不存在，开始自动构建...")
     try:
         from langchain_community.document_loaders import TextLoader
         from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -76,7 +76,7 @@ def ensure_vector_db():
         # 排除 requirements.txt
         txt_files = [f for f in txt_files if f != "./requirements.txt"]
         if not txt_files:
-            print("❌ 未找到知识库源文件(.txt)，请上传图书馆.txt 食堂快递.txt")
+            print(" 未找到知识库源文件(.txt)，请上传图书馆.txt 食堂快递.txt")
             return False
         docs = []
         for f in txt_files:
@@ -86,10 +86,10 @@ def ensure_vector_db():
         split_docs = splitter.split_documents(docs)
         emb = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
         Chroma.from_documents(split_docs, emb, persist_directory=DB_PATH)
-        print(f"✅ 向量库构建完成！共 {len(split_docs)} 个文本块")
+        print(f" 向量库构建完成！共 {len(split_docs)} 个文本块")
         return True
     except Exception as e:
-        print(f"❌ 自动建库失败：{e}")
+        print(f" 自动建库失败：{e}")
         return False
 
 # ========== RAG向量检索 ==========
