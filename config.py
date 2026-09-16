@@ -1,6 +1,6 @@
 import os
 # 大模型API配置（优先从环境变量读取）
-API_KEY = os.getenv("DEEPSEEK_API_KEY", "你的api密钥")
+API_KEY = os.getenv("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY")
 BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-chat")
 
